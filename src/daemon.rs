@@ -26,7 +26,7 @@ impl Runtime {
         })
     }
 
-    fn handle(&self, request: Request) -> Result<serde_json::Value> {
+    async fn handle(&self, request: Request) -> Result<serde_json::Value> {
         match request {
             Request::Ping => Ok(serde_json::json!({
                 "status": "ok",
@@ -65,16 +65,43 @@ impl Runtime {
                 session,
                 after,
                 limit,
+                raw,
             } => Ok(serde_json::to_value(
-                self.sessions.get(&session)?.output(after, limit)?,
+                self.sessions.get(&session)?.output(after, limit, raw)?,
             )?),
+            Request::Wait {
+                session,
+                after,
+                limit,
+                timeout_ms,
+                raw,
+            } => {
+                let session = self.sessions.get(&session)?;
+                tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+                    Ok(serde_json::to_value(
+                        session.wait(after, limit, timeout_ms, raw)?,
+                    )?)
+                })
+                .await
+                .context("join session wait task")?
+            }
             Request::Interrupt { session } => Ok(serde_json::to_value(
                 self.sessions.get(&session)?.interrupt()?,
             )?),
             Request::Stop { session } => {
                 let session = self.sessions.get(&session)?;
-                session.stop()?;
-                Ok(serde_json::to_value(session.info())?)
+                tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+                    session.stop()?;
+                    Ok(serde_json::to_value(session.info())?)
+                })
+                .await
+                .context("join session stop task")?
+            }
+            Request::Delete { session } => Ok(serde_json::json!({
+                "deleted": self.sessions.delete(&session)?
+            })),
+            Request::Prune { older_than_ms } => {
+                Ok(serde_json::to_value(self.sessions.prune(older_than_ms)?)?)
             }
             Request::Shutdown => {
                 self.sessions.stop_all();
@@ -121,7 +148,7 @@ async fn handle_connection(stream: UnixStream, runtime: Arc<Runtime>) -> Result<
     BufReader::new(reader).read_line(&mut line).await?;
 
     let response = match serde_json::from_str::<Envelope>(&line) {
-        Ok(envelope) => match runtime.handle(envelope.request) {
+        Ok(envelope) => match runtime.handle(envelope.request).await {
             Ok(result) => Response::success(envelope.id, result),
             Err(error) => Response::failure(envelope.id, format!("{error:#}")),
         },

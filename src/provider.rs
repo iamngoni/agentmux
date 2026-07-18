@@ -1,6 +1,6 @@
 use crate::protocol::{SafetyProfile, SpawnMode};
 use anyhow::{Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{env, path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,7 +26,7 @@ pub struct ProviderInfo {
     pub capabilities: ProviderCapabilities,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchMode {
     Interactive,

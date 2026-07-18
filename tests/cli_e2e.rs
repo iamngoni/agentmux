@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::{
     ffi::OsStr,
     path::Path,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     thread,
     time::Duration,
 };
@@ -196,6 +196,271 @@ fn headless_final_text_and_empty_result_classification_are_truthful() {
     );
 }
 
+#[test]
+fn wait_wakes_on_output_and_times_out_when_unchanged() {
+    let state = tempfile::tempdir().expect("create isolated state directory");
+    let _guard = DaemonGuard {
+        state_dir: state.path(),
+    };
+
+    assert_success(command(state.path(), ["--json", "daemon", "start"]));
+    assert_success(command(
+        state.path(),
+        ["--json", "spawn", "waiter", "--provider", "shell"],
+    ));
+    let initial = json(command(state.path(), ["--json", "output", "waiter"]));
+    let cursor = initial["cursor"].as_u64().expect("initial cursor");
+
+    let mut waiting = command_builder(state.path());
+    let child = waiting
+        .args([
+            "--json",
+            "wait",
+            "waiter",
+            "--after",
+            &cursor.to_string(),
+            "--timeout-ms",
+            "2000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wait command");
+    thread::sleep(Duration::from_millis(100));
+    assert_success(command(
+        state.path(),
+        ["--json", "send", "waiter", "printf 'wait-proof\\n'"],
+    ));
+    let first_wake = json(child.wait_with_output().expect("wait command output"));
+    assert_eq!(first_wake["changed"], true);
+    assert_eq!(first_wake["timed_out"], false);
+
+    let mut next_cursor = first_wake["output"]["cursor"]
+        .as_u64()
+        .expect("first wait cursor");
+    let mut observed = first_wake["output"]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("wait-proof"));
+    for _ in 0..5 {
+        if observed {
+            break;
+        }
+        let cursor = next_cursor.to_string();
+        let wake = json(command(
+            state.path(),
+            [
+                "--json",
+                "wait",
+                "waiter",
+                "--after",
+                &cursor,
+                "--timeout-ms",
+                "500",
+            ],
+        ));
+        next_cursor = wake["output"]["cursor"].as_u64().expect("wait cursor");
+        observed = wake["output"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("wait-proof"));
+    }
+    assert!(observed, "wait never delivered the expected output marker");
+
+    thread::sleep(Duration::from_millis(100));
+    let settled = json(command(state.path(), ["--json", "output", "waiter"]));
+    next_cursor = settled["cursor"].as_u64().expect("settled cursor");
+    let next_cursor = next_cursor.to_string();
+    let timed_out = json(command(
+        state.path(),
+        [
+            "--json",
+            "wait",
+            "waiter",
+            "--after",
+            &next_cursor,
+            "--timeout-ms",
+            "50",
+        ],
+    ));
+    assert_eq!(timed_out["changed"], false);
+    assert_eq!(timed_out["timed_out"], true);
+    assert_success(command(state.path(), ["--json", "stop", "waiter"]));
+}
+
+#[test]
+fn completed_sessions_survive_restart_and_can_be_deleted_or_pruned() {
+    let state = tempfile::tempdir().expect("create isolated state directory");
+    let _guard = DaemonGuard {
+        state_dir: state.path(),
+    };
+
+    assert_success(command(state.path(), ["--json", "daemon", "start"]));
+    spawn_fixture(state.path(), "recoverable", "printf 'persisted-proof\\n'");
+    poll_json(state.path(), ["--json", "status", "recoverable"], |value| {
+        value["process_status"] == "exited"
+    });
+    assert_success(command(state.path(), ["--json", "daemon", "stop"]));
+    assert_success(command(state.path(), ["--json", "daemon", "start"]));
+
+    let recovered = json(command(state.path(), ["--json", "status", "recoverable"]));
+    assert_eq!(recovered["status"], "completed");
+    assert_eq!(recovered["final_text"], "persisted-proof");
+    assert!(recovered["usage"].is_null());
+
+    let deleted = json(command(state.path(), ["--json", "delete", "recoverable"]));
+    assert_eq!(deleted["deleted"]["name"], "recoverable");
+    assert_failure_with(
+        &command(state.path(), ["--json", "status", "recoverable"]),
+        "not found",
+    );
+
+    spawn_fixture(state.path(), "prune-me", "printf 'old-proof\\n'");
+    poll_json(state.path(), ["--json", "status", "prune-me"], |value| {
+        value["process_status"] == "exited"
+    });
+    thread::sleep(Duration::from_millis(5));
+    let pruned = json(command(
+        state.path(),
+        ["--json", "prune", "--older-than-ms", "1"],
+    ));
+    assert_eq!(pruned["count"], 1);
+    assert_eq!(pruned["deleted"][0], "prune-me");
+}
+
+#[test]
+fn crashed_daemon_reconciles_running_session_as_orphaned() {
+    let state = tempfile::tempdir().expect("create isolated state directory");
+    let _guard = DaemonGuard {
+        state_dir: state.path(),
+    };
+
+    assert_success(command(state.path(), ["--json", "daemon", "start"]));
+    let spawned = json(command(
+        state.path(),
+        ["--json", "spawn", "orphan", "--provider", "shell"],
+    ));
+    let child_pid = spawned["process_id"].as_u64().expect("child pid");
+    let daemon_pid = std::fs::read_to_string(state.path().join("agentmux.pid"))
+        .expect("daemon pid")
+        .trim()
+        .to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-9", &daemon_pid])
+            .status()
+            .expect("kill test daemon")
+            .success()
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert_success(command(state.path(), ["--json", "daemon", "start"]));
+
+    let orphaned = json(command(state.path(), ["--json", "status", "orphan"]));
+    assert_eq!(orphaned["status"], "orphaned");
+    assert_eq!(orphaned["process_status"], "orphaned");
+    assert_eq!(orphaned["outcome"], "unknown");
+    assert_failure_with(
+        &command(state.path(), ["--json", "send", "orphan", "hello"]),
+        "not running",
+    );
+    let _ = Command::new("kill")
+        .args(["-9", &child_pid.to_string()])
+        .status();
+    assert_success(command(state.path(), ["--json", "delete", "orphan"]));
+}
+
+#[test]
+fn output_is_redacted_and_rotated_with_cursor_gap_reporting() {
+    let state = tempfile::tempdir().expect("create isolated state directory");
+    let _guard = DaemonGuard {
+        state_dir: state.path(),
+    };
+
+    assert_success(command(state.path(), ["--json", "daemon", "start"]));
+    assert_success(command(
+        state.path(),
+        ["--json", "spawn", "retention", "--provider", "shell"],
+    ));
+    assert_success(command(
+        state.path(),
+        [
+            "--json",
+            "send",
+            "retention",
+            "printf 'Authorization: Bearer abc123 API_TOKEN=secret me@example.com\\n'",
+        ],
+    ));
+    let redacted = poll_json(state.path(), ["--json", "output", "retention"], |value| {
+        value["redactions_applied"] == true
+    });
+    for secret in ["abc123", "secret", "me@example.com"] {
+        assert!(
+            !redacted["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(secret)
+        );
+        assert!(
+            !redacted["normalized_text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(secret)
+        );
+    }
+    let raw = json(command(
+        state.path(),
+        ["--json", "output", "retention", "--raw"],
+    ));
+    assert_eq!(raw["raw"], true);
+    assert!(!raw["text"].as_str().unwrap_or_default().contains("abc123"));
+
+    assert_success(command(
+        state.path(),
+        [
+            "--json",
+            "send",
+            "retention",
+            "i=0; while [ $i -lt 500 ]; do printf 'rotation-line-%04d-xxxxxxxxxxxxxxxx\\n' $i; i=$((i+1)); done",
+        ],
+    ));
+    poll_json(state.path(), ["--json", "status", "retention"], |value| {
+        value["output_cursor"]
+            .as_u64()
+            .is_some_and(|cursor| cursor > 5000)
+    });
+    let rotated = json(command(
+        state.path(),
+        ["--json", "output", "retention", "--after", "0"],
+    ));
+    assert_eq!(rotated["dropped_before"], true);
+    assert!(rotated["after"].as_u64().is_some_and(|after| after > 0));
+    for entry in std::fs::read_dir(state.path().join("sessions")).expect("session files") {
+        let entry = entry.expect("session entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".log") || name.ends_with(".log.1") {
+            assert!(entry.metadata().expect("log metadata").len() <= 1024);
+        }
+    }
+    assert_success(command(state.path(), ["--json", "stop", "retention"]));
+}
+
+fn spawn_fixture(state_dir: &Path, name: &str, script: &str) {
+    assert_success(command(
+        state_dir,
+        [
+            "--json",
+            "spawn",
+            name,
+            "--provider",
+            "fixture",
+            "--mode",
+            "headless",
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ],
+    ));
+}
+
 fn poll_json<I, S, F>(state_dir: &Path, args: I, predicate: F) -> Value
 where
     I: Clone + IntoIterator<Item = S>,
@@ -221,11 +486,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new(env!("CARGO_BIN_EXE_agentmux"))
+    command_builder(state_dir)
         .args(args)
-        .env("AGENTMUX_STATE_DIR", state_dir)
         .output()
         .expect("run agentmux")
+}
+
+fn command_builder(state_dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentmux"));
+    command
+        .env("AGENTMUX_STATE_DIR", state_dir)
+        .env("AGENTMUX_LOG_SEGMENT_BYTES", "1024");
+    command
 }
 
 fn json(output: Output) -> Value {

@@ -81,11 +81,38 @@ enum Command {
         after: u64,
         #[arg(long, default_value_t = DEFAULT_OUTPUT_LIMIT)]
         limit: usize,
+        #[arg(
+            long,
+            help = "Return redacted raw PTY bytes instead of normalized text"
+        )]
+        raw: bool,
+    },
+    /// Wait for new output or a terminal lifecycle state.
+    Wait {
+        session: String,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long, default_value_t = DEFAULT_OUTPUT_LIMIT)]
+        limit: usize,
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u64,
+        #[arg(
+            long,
+            help = "Return redacted raw PTY bytes instead of normalized text"
+        )]
+        raw: bool,
     },
     /// Send Ctrl-C to a running session.
     Interrupt { session: String },
     /// Terminate a session process.
     Stop { session: String },
+    /// Delete a finished or orphaned session and its retained artifacts.
+    Delete { session: String },
+    /// Delete terminal sessions older than the given duration.
+    Prune {
+        #[arg(long)]
+        older_than_ms: u64,
+    },
     /// Serve Agentmux tools over MCP stdio.
     Mcp,
 }
@@ -182,13 +209,30 @@ async fn handle_command(command: Command) -> Result<Value> {
             session,
             after,
             limit,
+            raw,
         } => Request::Output {
             session,
             after,
             limit,
+            raw,
+        },
+        Command::Wait {
+            session,
+            after,
+            limit,
+            timeout_ms,
+            raw,
+        } => Request::Wait {
+            session,
+            after,
+            limit,
+            timeout_ms,
+            raw,
         },
         Command::Interrupt { session } => Request::Interrupt { session },
         Command::Stop { session } => Request::Stop { session },
+        Command::Delete { session } => Request::Delete { session },
+        Command::Prune { older_than_ms } => Request::Prune { older_than_ms },
         Command::Daemon { .. } | Command::Mcp => unreachable!(),
     };
     client::call(request).await

@@ -4,7 +4,9 @@ Persistent, observable, steerable sessions for AI agents.
 
 Agentmux is the local control plane behind the idea of “tmux for AI agents.” A daemon owns provider processes and pseudo-terminals (PTYs); a CLI and MCP server operate those same sessions through a small Unix-socket protocol.
 
-This repository currently contains an early vertical slice for macOS and Linux. It supports safe headless tasks, long-running interactive sessions, incremental observation, semantic steering, raw terminal control, and truthful process/task outcomes. It does not yet provide daemon-restart recovery, Git worktree isolation, native SDK/ACP integrations, terminal screen reconstruction, log rotation, long-poll subscriptions, or SQLite persistence.
+This repository currently contains an early vertical slice for macOS and Linux. It supports safe headless tasks, long-running interactive sessions, incremental observation, semantic steering, raw terminal control, truthful process/task outcomes, durable completed-session metadata, terminal screen reconstruction, bounded logs, and long-poll waits. A daemon restart reloads completed sessions and explicitly marks formerly running sessions as `orphaned` because PTY ownership cannot be recovered safely.
+
+Agentmux does not yet provide Git worktree isolation, native SDK/ACP integrations, reconnectable live PTYs, or SQLite persistence. Versioned JSON sidecars are the current durable store.
 
 ## Supported agent CLIs
 
@@ -100,12 +102,22 @@ agentmux spawn reviewer \
   -- my-agent --interactive
 ```
 
-Read only new terminal output by retaining the returned byte cursor:
+Read only new terminal output by retaining the returned logical byte cursor:
 
 ```bash
 agentmux --json output backend --after 0
 agentmux --json output backend --after 18420
 ```
+
+Output is normalized and redacted by default. It also includes a reconstructed `screen_text` snapshot for full-screen TUIs. Use `--raw` only when ANSI/control details are needed; raw reads are still redacted. If bounded-log rotation has discarded the requested cursor, `dropped_before` is true and the response begins at the oldest retained byte.
+
+Long-poll instead of repeatedly polling:
+
+```bash
+agentmux --json wait backend --after 18420 --timeout-ms 10000
+```
+
+`wait` wakes when output or lifecycle state changes and caps each wait at 30 seconds. Advance to the returned `output.cursor`; a wake can represent a state transition before new output arrives.
 
 Useful lifecycle commands:
 
@@ -116,12 +128,15 @@ agentmux send <session> <message>
 agentmux key <session> <enter|escape|ctrl_c|up|down>
 agentmux input <session> <base64>
 agentmux output <session> --after <cursor>
+agentmux wait <session> --after <cursor> --timeout-ms <milliseconds>
 agentmux interrupt <session>
 agentmux stop <session>
+agentmux delete <finished-or-orphaned-session>
+agentmux prune --older-than-ms <milliseconds>
 agentmux daemon stop
 ```
 
-Set `AGENTMUX_STATE_DIR` to override the default state directory at `~/.local/state/agentmux`.
+Set `AGENTMUX_STATE_DIR` to override the default state directory at `~/.local/state/agentmux`. Session metadata, reconstructed screens, and two bounded log segments live under `sessions/`. Files are owner-only; returned output and persisted final text apply best-effort token, credential, and account-identifier redaction. Token/cost usage fields stay `null` until a provider adapter can report them truthfully.
 
 ## MCP
 
@@ -142,11 +157,14 @@ agents_send
 agents_key
 agents_input
 agents_output
+agents_wait
 agents_interrupt
 agents_stop
+agents_delete
+agents_prune
 ```
 
-All tools call the same local daemon used by the CLI. `agents_interrupt` confirms only that Ctrl-C was delivered; it does not claim that a turn was cancelled. `agents_stop` waits until the child process is observed gone before returning. The bundled [`agentmux-supervisor` skill](skills/agentmux-supervisor/SKILL.md) teaches a parent agent to choose headless or interactive mode, poll incrementally, verify actual workspace state, and steer a child until acceptance criteria pass.
+All tools call the same local daemon used by the CLI. Prefer `agents_wait` with the last output cursor for efficient supervision. `agents_interrupt` confirms only that Ctrl-C was delivered; it does not claim that a turn was cancelled. `agents_stop` waits until the child process is observed gone before returning. `agents_delete` refuses to remove a live session; `agents_prune` only removes non-running sessions older than the requested retention period. The bundled [`agentmux-supervisor` skill](skills/agentmux-supervisor/SKILL.md) teaches a parent agent to choose headless or interactive mode, wait incrementally, verify actual workspace state, and steer a child until acceptance criteria pass.
 
 ## Architecture
 

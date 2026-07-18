@@ -84,6 +84,33 @@ struct OutputParams {
     #[serde(default = "default_output_limit")]
     #[schemars(description = "Maximum bytes to return, capped at 1 MiB")]
     limit: usize,
+    #[serde(default)]
+    #[schemars(description = "Return redacted raw PTY text instead of normalized text")]
+    raw: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct WaitParams {
+    #[schemars(description = "Session name or ID")]
+    session: String,
+    #[serde(default)]
+    #[schemars(description = "Wait for output after this logical byte cursor")]
+    after: u64,
+    #[serde(default = "default_output_limit")]
+    #[schemars(description = "Maximum bytes to return, capped at 1 MiB")]
+    limit: usize,
+    #[serde(default = "default_wait_timeout_ms")]
+    #[schemars(description = "Long-poll timeout in milliseconds, capped at 30000")]
+    timeout_ms: u64,
+    #[serde(default)]
+    #[schemars(description = "Return redacted raw PTY text instead of normalized text")]
+    raw: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PruneParams {
+    #[schemars(description = "Delete terminal sessions older than this many milliseconds")]
+    older_than_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -181,12 +208,35 @@ impl AgentmuxMcp {
             session,
             after,
             limit,
+            raw,
         }): Parameters<OutputParams>,
     ) -> Result<String, String> {
         call(Request::Output {
             session,
             after,
             limit,
+            raw,
+        })
+        .await
+    }
+
+    #[tool(description = "Wait for new output or a terminal/orphaned lifecycle state")]
+    async fn agents_wait(
+        &self,
+        Parameters(WaitParams {
+            session,
+            after,
+            limit,
+            timeout_ms,
+            raw,
+        }): Parameters<WaitParams>,
+    ) -> Result<String, String> {
+        call(Request::Wait {
+            session,
+            after,
+            limit,
+            timeout_ms,
+            raw,
         })
         .await
     }
@@ -207,6 +257,22 @@ impl AgentmuxMcp {
         Parameters(SessionParam { session }): Parameters<SessionParam>,
     ) -> Result<String, String> {
         call(Request::Stop { session }).await
+    }
+
+    #[tool(description = "Delete a finished or orphaned session and its retained artifacts")]
+    async fn agents_delete(
+        &self,
+        Parameters(SessionParam { session }): Parameters<SessionParam>,
+    ) -> Result<String, String> {
+        call(Request::Delete { session }).await
+    }
+
+    #[tool(description = "Delete terminal sessions older than a required retention duration")]
+    async fn agents_prune(
+        &self,
+        Parameters(PruneParams { older_than_ms }): Parameters<PruneParams>,
+    ) -> Result<String, String> {
+        call(Request::Prune { older_than_ms }).await
     }
 }
 
@@ -247,4 +313,8 @@ fn default_provider() -> String {
 
 fn default_output_limit() -> usize {
     DEFAULT_OUTPUT_LIMIT
+}
+
+fn default_wait_timeout_ms() -> u64 {
+    10_000
 }

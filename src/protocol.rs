@@ -39,12 +39,31 @@ pub enum Request {
         after: u64,
         #[serde(default = "default_output_limit")]
         limit: usize,
+        #[serde(default)]
+        raw: bool,
+    },
+    Wait {
+        session: String,
+        #[serde(default)]
+        after: u64,
+        #[serde(default = "default_output_limit")]
+        limit: usize,
+        #[serde(default = "default_wait_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default)]
+        raw: bool,
     },
     Interrupt {
         session: String,
     },
     Stop {
         session: String,
+    },
+    Delete {
+        session: String,
+    },
+    Prune {
+        older_than_ms: u64,
     },
     Shutdown,
 }
@@ -162,4 +181,8 @@ impl Response {
 
 fn default_output_limit() -> usize {
     DEFAULT_OUTPUT_LIMIT
+}
+
+fn default_wait_timeout_ms() -> u64 {
+    10_000
 }

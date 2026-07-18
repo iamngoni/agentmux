@@ -6,6 +6,31 @@ Agentmux is the local control plane behind the idea of “tmux for AI agents.”
 
 This repository currently contains an early vertical slice for macOS and Linux. It proves session ownership, incremental observation, and mid-session steering. It does not yet provide daemon-restart recovery, Git worktree isolation, native provider protocols, terminal screen emulation, or SQLite persistence.
 
+## Supported agent CLIs
+
+Agentmux can currently offload work to these CLI harnesses through persistent PTY sessions:
+
+| Provider | Command | Harness |
+| --- | --- | --- |
+| `claude` | `claude` | Claude Code |
+| `codex` | `codex` | OpenAI Codex CLI |
+| `grok` | `grok` | Grok Build |
+| `kimi` | `kimi` | Kimi Code CLI |
+| `antigravity` | `agy` | Antigravity CLI |
+| `gemini` | `agy` | Gemini agents hosted by Antigravity |
+| `shell` | `/bin/sh` | Generic interactive shell |
+
+Run `agentmux providers` to see which harnesses are installed on the current machine. Any other terminal-native agent can use the generic adapter by supplying its command after `--`:
+
+```bash
+agentmux spawn custom-worker \
+  --provider custom-agent \
+  --cwd . \
+  -- custom-agent --interactive
+```
+
+Built-in support currently means Agentmux can launch, observe, message, interrupt, and terminate the harness through a PTY. Provider-native structured events, logical conversation resume, and startup/readiness adapters remain future work.
+
 ## Build
 
 ```bash
@@ -98,4 +123,4 @@ CLI ---------+
 MCP stdio ---+
 ```
 
-Provider presets are intentionally thin. `claude`, `codex`, `grok`, and `kimi` launch their matching commands through the generic PTY adapter. `antigravity` and `gemini` both launch the current Antigravity CLI command, `agy`; use an explicit `agy --agent ...` command when a specific Antigravity-hosted model is required. Native structured drivers such as Kimi's ACP mode can be added later without changing the CLI/MCP contract.
+Provider presets are intentionally thin. Use an explicit `agy --agent ...` command when a specific Antigravity-hosted model is required. Native structured drivers such as Kimi's ACP mode can be added later without changing the CLI/MCP contract.

@@ -66,13 +66,18 @@ fn start_daemon_process() -> Result<()> {
         .open(&log_path)?;
     let stderr = stdout.try_clone()?;
 
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("start agentmux daemon")?;
+        .stderr(Stdio::from(stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.spawn().context("start agentmux daemon")?;
     Ok(())
 }
 

@@ -1,6 +1,8 @@
 use crate::{
     client,
-    protocol::{DEFAULT_OUTPUT_LIMIT, Request, SpawnRequest},
+    protocol::{
+        DEFAULT_OUTPUT_LIMIT, Request, SafetyProfile, SpawnMode, SpawnRequest, TerminalKey,
+    },
 };
 use anyhow::Result;
 use rmcp::{
@@ -31,8 +33,18 @@ struct SpawnParams {
         description = "Absolute working directory; defaults to the MCP server working directory"
     )]
     cwd: Option<String>,
-    #[schemars(description = "Initial instruction written to the PTY after launch")]
+    #[schemars(
+        description = "Initial instruction. Built-in providers run it headlessly by default; use mode=interactive for a steerable TUI session"
+    )]
     prompt: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Launch mode: auto, interactive, or headless")]
+    mode: SpawnMode,
+    #[serde(default)]
+    #[schemars(
+        description = "Safety profile: read_only, workspace_write, or provider_default. Kimi headless prompt mode requires provider_default; use interactive read_only for Kimi plan mode"
+    )]
+    safety: SafetyProfile,
     #[serde(default)]
     #[schemars(description = "Explicit command and arguments; required for unknown providers")]
     command: Vec<String>,
@@ -44,6 +56,22 @@ struct SendParams {
     session: String,
     #[schemars(description = "Follow-up instruction to send to the running session")]
     message: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct KeyParams {
+    #[schemars(description = "Session name or ID")]
+    session: String,
+    #[schemars(description = "Terminal key: enter, escape, ctrl_c, up, or down")]
+    key: TerminalKey,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct InputParams {
+    #[schemars(description = "Session name or ID")]
+    session: String,
+    #[schemars(description = "Raw PTY bytes encoded as standard base64")]
+    data_base64: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -96,6 +124,8 @@ impl AgentmuxMcp {
             cwd: cwd.to_string_lossy().into_owned(),
             prompt: params.prompt,
             command: params.command,
+            mode: params.mode,
+            safety: params.safety,
         }))
         .await
     }
@@ -121,6 +151,29 @@ impl AgentmuxMcp {
         call(Request::Send { session, message }).await
     }
 
+    #[tool(description = "Send one terminal control key to an interactive session")]
+    async fn agents_key(
+        &self,
+        Parameters(KeyParams { session, key }): Parameters<KeyParams>,
+    ) -> Result<String, String> {
+        call(Request::Key { session, key }).await
+    }
+
+    #[tool(description = "Write standard-base64-encoded raw bytes to an interactive session PTY")]
+    async fn agents_input(
+        &self,
+        Parameters(InputParams {
+            session,
+            data_base64,
+        }): Parameters<InputParams>,
+    ) -> Result<String, String> {
+        call(Request::Input {
+            session,
+            data_base64,
+        })
+        .await
+    }
+
     #[tool(description = "Read incremental terminal output using a byte cursor")]
     async fn agents_output(
         &self,
@@ -138,7 +191,9 @@ impl AgentmuxMcp {
         .await
     }
 
-    #[tool(description = "Send Ctrl-C to a running session without terminating it")]
+    #[tool(
+        description = "Deliver Ctrl-C to a running session; delivery does not imply that the turn was cancelled"
+    )]
     async fn agents_interrupt(
         &self,
         Parameters(SessionParam { session }): Parameters<SessionParam>,

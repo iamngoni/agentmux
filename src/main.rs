@@ -6,7 +6,9 @@ mod protocol;
 mod provider;
 mod session;
 
-use crate::protocol::{DEFAULT_OUTPUT_LIMIT, Request, SpawnRequest};
+use crate::protocol::{
+    DEFAULT_OUTPUT_LIMIT, Request, SafetyProfile, SpawnMode, SpawnRequest, TerminalKey,
+};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
@@ -34,7 +36,7 @@ enum Command {
     },
     /// Show built-in provider presets and whether their commands are installed.
     Providers,
-    /// Start a persistent PTY-backed session.
+    /// Start an agent session (prompted built-ins default to safe headless mode).
     Spawn {
         name: String,
         #[arg(long, default_value = "shell")]
@@ -43,6 +45,15 @@ enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         prompt: Option<String>,
+        #[arg(long, value_enum, default_value_t = SpawnMode::Auto)]
+        mode: SpawnMode,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = SafetyProfile::ReadOnly,
+            help = "Headless safety profile; Kimi prompt mode requires provider_default"
+        )]
+        safety: SafetyProfile,
         #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -52,6 +63,17 @@ enum Command {
     Status { session: String },
     /// Send a follow-up message to a running session.
     Send { session: String, message: String },
+    /// Send a terminal key without semantic message handling.
+    Key {
+        session: String,
+        #[arg(value_enum)]
+        key: TerminalKey,
+    },
+    /// Write base64-encoded bytes directly to the session PTY.
+    Input {
+        session: String,
+        data_base64: String,
+    },
     /// Read terminal output after a byte cursor.
     Output {
         session: String,
@@ -129,6 +151,8 @@ async fn handle_command(command: Command) -> Result<Value> {
             provider,
             cwd,
             prompt,
+            mode,
+            safety,
             command,
         } => Request::Spawn(SpawnRequest {
             name,
@@ -140,10 +164,20 @@ async fn handle_command(command: Command) -> Result<Value> {
                 .into_owned(),
             prompt,
             command,
+            mode,
+            safety,
         }),
         Command::List => Request::List,
         Command::Status { session } => Request::Status { session },
         Command::Send { session, message } => Request::Send { session, message },
+        Command::Key { session, key } => Request::Key { session, key },
+        Command::Input {
+            session,
+            data_base64,
+        } => Request::Input {
+            session,
+            data_base64,
+        },
         Command::Output {
             session,
             after,

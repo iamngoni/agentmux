@@ -5,6 +5,7 @@ use crate::{
     session::SessionRegistry,
 };
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{path::Path, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -41,7 +42,24 @@ impl Runtime {
             Request::Send { session, message } => {
                 let session = self.sessions.get(&session)?;
                 session.send(&message)?;
-                Ok(serde_json::json!({ "sent": true }))
+                Ok(serde_json::json!({ "sent": true, "submitted": true }))
+            }
+            Request::Key { session, key } => {
+                self.sessions.get(&session)?.key(key)?;
+                Ok(serde_json::json!({ "delivered": true }))
+            }
+            Request::Input {
+                session,
+                data_base64,
+            } => {
+                let bytes = STANDARD
+                    .decode(&data_base64)
+                    .context("decode base64 terminal input")?;
+                self.sessions.get(&session)?.raw_input(&bytes)?;
+                Ok(serde_json::json!({
+                    "delivered": true,
+                    "bytes": bytes.len()
+                }))
             }
             Request::Output {
                 session,
@@ -50,10 +68,9 @@ impl Runtime {
             } => Ok(serde_json::to_value(
                 self.sessions.get(&session)?.output(after, limit)?,
             )?),
-            Request::Interrupt { session } => {
-                self.sessions.get(&session)?.interrupt()?;
-                Ok(serde_json::json!({ "interrupted": true }))
-            }
+            Request::Interrupt { session } => Ok(serde_json::to_value(
+                self.sessions.get(&session)?.interrupt()?,
+            )?),
             Request::Stop { session } => {
                 let session = self.sessions.get(&session)?;
                 session.stop()?;

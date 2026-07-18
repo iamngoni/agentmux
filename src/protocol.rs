@@ -25,6 +25,14 @@ pub enum Request {
         session: String,
         message: String,
     },
+    Key {
+        session: String,
+        key: TerminalKey,
+    },
+    Input {
+        session: String,
+        data_base64: String,
+    },
     Output {
         session: String,
         #[serde(default)]
@@ -50,6 +58,65 @@ pub struct SpawnRequest {
     pub prompt: Option<String>,
     #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub mode: SpawnMode,
+    #[serde(default)]
+    pub safety: SafetyProfile,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum SpawnMode {
+    #[default]
+    Auto,
+    Interactive,
+    Headless,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum SafetyProfile {
+    #[default]
+    ReadOnly,
+    WorkspaceWrite,
+    ProviderDefault,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum TerminalKey {
+    Enter,
+    Escape,
+    CtrlC,
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

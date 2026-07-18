@@ -68,6 +68,27 @@ pub enum Request {
     Shutdown,
 }
 
+impl Request {
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping
+                | Self::Providers
+                | Self::List
+                | Self::Status { .. }
+                | Self::Output { .. }
+                | Self::Wait { .. }
+        )
+    }
+
+    pub fn wait_timeout_ms(&self) -> Option<u64> {
+        match self {
+            Self::Wait { timeout_ms, .. } => Some((*timeout_ms).min(30_000)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub name: String,

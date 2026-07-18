@@ -25,7 +25,7 @@ const PERSISTENCE_VERSION: u32 = 1;
 const DEFAULT_LOG_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 const FINAL_OUTPUT_LIMIT: usize = 1024 * 1024;
 const MAX_WAIT_MS: u64 = 30_000;
-const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -337,11 +337,12 @@ impl Session {
         let info = self.info();
         let retained = read_retained_output(&self.paths, info.output_cursor, after, limit)?;
         let raw_text = String::from_utf8_lossy(&retained.bytes).into_owned();
-        let normalized = normalize_output(&raw_text);
+        let normalized = normalize_provider_output(&info.provider, &raw_text);
         let (normalized_text, normalized_redacted) = redact_text(&normalized);
         let (raw_text, raw_redacted) = redact_text(&raw_text);
         let screen = std::fs::read_to_string(&self.paths.screen)
             .ok()
+            .map(|screen| normalize_provider_output(&info.provider, &screen))
             .map(|screen| redact_text(&screen))
             .filter(|(screen, _)| !screen.trim().is_empty());
         let screen_redacted = screen.as_ref().is_some_and(|(_, redacted)| *redacted);
@@ -594,31 +595,32 @@ impl SessionRegistry {
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {
-        let mut sessions: Vec<_> = self
+        let sessions: Vec<_> = self
             .sessions
             .read()
             .expect("session registry lock poisoned")
             .values()
-            .map(|session| session.info())
+            .cloned()
             .collect();
+        let mut sessions: Vec<_> = sessions.iter().map(|session| session.info()).collect();
         sessions.sort_by(|left, right| left.created_at_ms.cmp(&right.created_at_ms));
         sessions
     }
 
     pub fn get(&self, name_or_id: &str) -> Result<Arc<Session>> {
-        let sessions = self
-            .sessions
-            .read()
-            .expect("session registry lock poisoned");
-        sessions
-            .get(name_or_id)
-            .cloned()
-            .or_else(|| {
-                sessions
-                    .values()
-                    .find(|session| session.info().id == name_or_id)
-                    .cloned()
-            })
+        let candidates = {
+            let sessions = self
+                .sessions
+                .read()
+                .expect("session registry lock poisoned");
+            if let Some(session) = sessions.get(name_or_id) {
+                return Ok(Arc::clone(session));
+            }
+            sessions.values().cloned().collect::<Vec<_>>()
+        };
+        candidates
+            .into_iter()
+            .find(|session| session.info().id == name_or_id)
             .ok_or_else(|| anyhow::anyhow!("session '{name_or_id}' not found"))
     }
 
@@ -680,8 +682,12 @@ impl SessionRegistry {
             .filter(|session| session.info().process_status == ProcessStatus::Running)
             .cloned()
             .collect();
-        for session in sessions {
-            let _ = session.stop();
+        let handles: Vec<_> = sessions
+            .into_iter()
+            .map(|session| thread::spawn(move || session.stop()))
+            .collect();
+        for handle in handles {
+            let _ = handle.join();
         }
     }
 
@@ -983,10 +989,15 @@ fn spawn_waiter(
     thread::spawn(move || {
         let result = child.wait();
         let _ = reader_done.recv_timeout(Duration::from_secs(2));
+        let provider = info
+            .read()
+            .expect("session info lock poisoned")
+            .provider
+            .clone();
         let normalized = {
             let _guard = log_lock.lock().expect("session log lock poisoned");
             read_final_output(&paths)
-                .map(|output| redact_text(&normalize_output(&output)).0)
+                .map(|output| redact_text(&normalize_provider_output(&provider, &output)).0)
                 .unwrap_or_default()
         };
         let finished_at_ms = now_ms();
@@ -1240,6 +1251,20 @@ fn normalize_output(output: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
+fn normalize_provider_output(provider: &str, output: &str) -> String {
+    let normalized = normalize_output(output);
+    if provider != "kimi" {
+        return normalized;
+    }
+    normalized
+        .lines()
+        .filter(|line| line.trim() != "UserPromptSubmit hook {}")
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 fn redact_text(text: &str) -> (String, bool) {
     let mut redacted = text.to_string();
     redacted = BEARER_RE
@@ -1320,6 +1345,16 @@ mod tests {
     fn normalizes_ansi_carriage_returns_and_duplicate_redraws() {
         let output = "\x1b[31mhello\x1b[0m\r\nhello\rworld";
         assert_eq!(normalize_output(output), "hello\nworld");
+    }
+
+    #[test]
+    fn kimi_normalization_removes_empty_submit_hook_but_keeps_provider_error() {
+        let output = "UserPromptSubmit hook {}\nHTTP 403: quota exceeded";
+        assert_eq!(
+            normalize_provider_output("kimi", output),
+            "HTTP 403: quota exceeded"
+        );
+        assert_eq!(normalize_provider_output("codex", output), output);
     }
 
     #[test]

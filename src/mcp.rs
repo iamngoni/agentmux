@@ -12,7 +12,13 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
+use tokio::{sync::Semaphore, time::timeout};
+
+const MCP_CALL_LIMIT: usize = 32;
+const MCP_QUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+
+static MCP_CALL_SLOTS: Semaphore = Semaphore::const_new(MCP_CALL_LIMIT);
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SessionParam {
@@ -298,10 +304,11 @@ pub async fn serve() -> Result<()> {
 }
 
 async fn call(request: Request) -> Result<String, String> {
-    client::ensure_daemon()
+    let _permit = timeout(MCP_QUEUE_TIMEOUT, MCP_CALL_SLOTS.acquire())
         .await
-        .map_err(|error| format!("start daemon: {error:#}"))?;
-    let value = client::call(request)
+        .map_err(|_| "server_busy: MCP request queue exceeded 250 ms".to_string())?
+        .map_err(|_| "server_busy: MCP request admission closed".to_string())?;
+    let value = client::call_resilient(request)
         .await
         .map_err(|error| format!("agentmux request failed: {error:#}"))?;
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())

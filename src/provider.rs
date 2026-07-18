@@ -23,6 +23,8 @@ pub struct ProviderInfo {
     pub integration: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias_of: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_note: Option<&'static str>,
     pub capabilities: ProviderCapabilities,
 }
 
@@ -113,6 +115,9 @@ pub fn list() -> Vec<ProviderInfo> {
                     "pty"
                 },
                 alias_of: provider.alias_of,
+                safety_note: matches!(provider.name, "antigravity" | "gemini").then_some(
+                    "Non-interactive agy bypasses approval prompts, while plan mode plus the agy sandbox remain the enforcement boundary",
+                ),
                 capabilities: ProviderCapabilities {
                     interactive: true,
                     headless: provider.headless,
@@ -125,6 +130,10 @@ pub fn list() -> Vec<ProviderInfo> {
                     },
                     headless_safety_profiles: match provider.name {
                         "kimi" => vec!["provider_default_auto"],
+                        "antigravity" | "gemini" => vec![
+                            "read_only_sandbox_auto_approve",
+                            "workspace_write_sandbox_auto_approve",
+                        ],
                         "shell" => vec![],
                         _ => vec!["read_only", "workspace_write"],
                     },
@@ -301,8 +310,8 @@ fn build_launch(
             ]),
             None,
             match safety {
-                SafetyProfile::ReadOnly => "read_only_sandbox",
-                SafetyProfile::WorkspaceWrite => "workspace_write_sandbox",
+                SafetyProfile::ReadOnly => "read_only_sandbox_auto_approve",
+                SafetyProfile::WorkspaceWrite => "workspace_write_sandbox_auto_approve",
                 SafetyProfile::ProviderDefault => unreachable!(),
             },
         ),
@@ -480,6 +489,7 @@ mod tests {
                 "inspect only",
             ])
         );
+        assert_eq!(launch.safety_profile, "read_only_sandbox_auto_approve");
     }
 
     #[test]
@@ -522,6 +532,7 @@ mod tests {
             .expect("Gemini provider preset");
         assert_eq!(gemini.command, "agy");
         assert_eq!(gemini.alias_of, Some("antigravity"));
+        assert!(gemini.safety_note.is_some());
     }
 
     #[test]

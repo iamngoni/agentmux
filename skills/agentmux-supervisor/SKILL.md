@@ -24,6 +24,7 @@ Use Agentmux when a delegated task benefits from a persistent session that can b
 9. Use `agents_key` for Enter, Escape, Ctrl-C, or arrow keys and `agents_input` only for raw base64-encoded PTY input.
 10. Use `agents_interrupt` when the current operation must stop before a correction can be applied. Its response confirms signal delivery, not observed turn cancellation.
 11. Accept completion only after the stated checks pass. Call `agents_stop` when a live session is no longer needed; it returns only after the process is observed gone. Use `agents_delete` for an individual terminal session or `agents_prune` with an explicit retention duration for old terminal sessions.
+12. Treat `server_busy` as bounded backpressure and retry after a short delay. A `connection_lost` result after a mutation is ambiguous: inspect session state before deciding whether to repeat it. Never blindly replay `spawn`, `send`, `input`, `interrupt`, `stop`, `delete`, or `prune`.
 
 ## Safety
 
@@ -36,6 +37,7 @@ Use Agentmux when a delegated task benefits from a persistent session that can b
 - A headless session is intentionally one-turn and cannot accept `agents_send`; use interactive mode when follow-up context is required.
 - Treat `dropped_before: true` as a cursor gap caused by bounded-log retention. Continue from the returned cursor and use the current `screen_text`/workspace state rather than assuming missing history.
 - A session recovered as `orphaned` has durable history but no controllable PTY. Inspect it, then delete it or spawn a replacement; do not claim it was resumed.
+- Antigravity's `*_sandbox_auto_approve` profiles bypass non-interactive approval prompts; plan/workspace mode plus the `agy` sandbox are the stated enforcement boundary. Do not describe those profiles as ordinary prompted read-only sessions.
 
 ## Supervision loop
 

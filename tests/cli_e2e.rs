@@ -4,10 +4,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
 use std::{
     ffi::OsStr,
+    io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Child, ChildStdin, Command, Output, Stdio},
+    sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct DaemonGuard<'a> {
@@ -442,6 +444,161 @@ fn output_is_redacted_and_rotated_with_cursor_gap_reporting() {
     assert_success(command(state.path(), ["--json", "stop", "retention"]));
 }
 
+#[test]
+fn mcp_mixed_reader_stress_survives_terminal_transition_and_daemon_replacement() {
+    let state = tempfile::tempdir().expect("create isolated state directory");
+    let _guard = DaemonGuard {
+        state_dir: state.path(),
+    };
+
+    assert_success(command(state.path(), ["--json", "daemon", "start"]));
+    spawn_fixture(
+        state.path(),
+        "mcp-stress",
+        "i=0; while [ $i -lt 120 ]; do printf 'stress-line-%03d\\n' $i; i=$((i+1)); sleep 0.005; done",
+    );
+    let (mut mcp, mut input, output) = start_mcp(state.path());
+
+    let mut next_id = 2_u64;
+    for _ in 0..100 {
+        let mut expected = Vec::new();
+        for reader in 0..16 {
+            let (name, arguments) = match reader % 3 {
+                0 => (
+                    "agents_status",
+                    serde_json::json!({ "session": "mcp-stress" }),
+                ),
+                1 => (
+                    "agents_output",
+                    serde_json::json!({
+                        "session": "mcp-stress",
+                        "after": 0,
+                        "limit": 1024
+                    }),
+                ),
+                _ => (
+                    "agents_wait",
+                    serde_json::json!({
+                        "session": "mcp-stress",
+                        "after": 0,
+                        "limit": 1024,
+                        "timeout_ms": 50
+                    }),
+                ),
+            };
+            write_mcp(
+                &mut input,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": next_id,
+                    "method": "tools/call",
+                    "params": { "name": name, "arguments": arguments }
+                }),
+            );
+            expected.push(next_id);
+            next_id += 1;
+        }
+        input.flush().expect("flush MCP request wave");
+        for _ in 0..expected.len() {
+            let response = read_mcp(&output);
+            assert!(
+                response["error"].is_null(),
+                "MCP protocol error: {response}"
+            );
+            assert_ne!(
+                response["result"]["isError"], true,
+                "MCP tool error: {response}"
+            );
+            let id = response["id"].as_u64().expect("MCP response id");
+            assert!(
+                expected.contains(&id),
+                "unexpected MCP response: {response}"
+            );
+        }
+    }
+
+    let terminal = poll_json(state.path(), ["--json", "status", "mcp-stress"], |value| {
+        value["process_status"] == "exited"
+    });
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_success(command(state.path(), ["--json", "daemon", "stop"]));
+
+    let reconnect_started = Instant::now();
+    write_mcp(
+        &mut input,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": next_id,
+            "method": "tools/call",
+            "params": {
+                "name": "agents_status",
+                "arguments": { "session": "mcp-stress" }
+            }
+        }),
+    );
+    input.flush().expect("flush reconnect request");
+    let reconnected = read_mcp(&output);
+    assert_ne!(
+        reconnected["result"]["isError"], true,
+        "MCP did not reconnect: {reconnected}"
+    );
+    assert!(
+        reconnect_started.elapsed() < Duration::from_secs(2),
+        "MCP reconnect exceeded two seconds"
+    );
+    assert_success(command(state.path(), ["--json", "daemon", "status"]));
+    close_mcp(&mut mcp, input);
+}
+
+#[test]
+fn daemon_shutdown_is_bounded_while_long_poll_readers_are_active() {
+    let state = tempfile::tempdir().expect("create isolated state directory");
+    let _guard = DaemonGuard {
+        state_dir: state.path(),
+    };
+
+    assert_success(command(state.path(), ["--json", "daemon", "start"]));
+    spawn_fixture(state.path(), "shutdown-load", "sleep 30; printf 'done\\n'");
+    let mut readers = Vec::new();
+    for _ in 0..16 {
+        readers.push(
+            command_builder(state.path())
+                .args([
+                    "--json",
+                    "wait",
+                    "shutdown-load",
+                    "--after",
+                    "0",
+                    "--timeout-ms",
+                    "30000",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn active wait reader"),
+        );
+    }
+    thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    assert_success(command(state.path(), ["--json", "daemon", "stop"]));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "graceful daemon shutdown exceeded five seconds"
+    );
+
+    for reader in readers {
+        let output = reader.wait_with_output().expect("reap active wait reader");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("connection_lost") || stderr.contains("daemon_unavailable"),
+                "wait reader failed without a typed transport error: {stderr}"
+            );
+        }
+    }
+}
+
 fn spawn_fixture(state_dir: &Path, name: &str, script: &str) {
     assert_success(command(
         state_dir,
@@ -498,6 +655,85 @@ fn command_builder(state_dir: &Path) -> Command {
         .env("AGENTMUX_STATE_DIR", state_dir)
         .env("AGENTMUX_LOG_SEGMENT_BYTES", "1024");
     command
+}
+
+fn start_mcp(state_dir: &Path) -> (Child, ChildStdin, mpsc::Receiver<Value>) {
+    let mut child = command_builder(state_dir)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn MCP server");
+    let mut input = child.stdin.take().expect("MCP stdin");
+    let stdout = child.stdout.take().expect("MCP stdout");
+    let (responses, output) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => match serde_json::from_str(&line) {
+                    Ok(response) => {
+                        if responses.send(response).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+            }
+        }
+    });
+    write_mcp(
+        &mut input,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "agentmux-e2e", "version": "1" }
+            }
+        }),
+    );
+    input.flush().expect("flush MCP initialize");
+    let initialized = read_mcp(&output);
+    assert_eq!(initialized["id"], 1);
+    write_mcp(
+        &mut input,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    );
+    input.flush().expect("flush MCP initialized notification");
+    (child, input, output)
+}
+
+fn write_mcp(input: &mut ChildStdin, request: &Value) {
+    writeln!(input, "{request}").expect("write MCP request");
+}
+
+fn read_mcp(output: &mpsc::Receiver<Value>) -> Value {
+    output
+        .recv_timeout(Duration::from_secs(3))
+        .expect("MCP response within three seconds")
+}
+
+fn close_mcp(child: &mut Child, input: ChildStdin) {
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll MCP process").is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("MCP server did not exit within two seconds after stdin closed");
 }
 
 fn json(output: Output) -> Value {
